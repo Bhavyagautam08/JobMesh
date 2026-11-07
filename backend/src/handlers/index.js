@@ -1,16 +1,19 @@
 import { calculatePrimes, calculatePrimesHandler } from "./calculate-primes.handler.js";
 import { processJson, processJsonHandler } from "./process-json.handler.js";
-import { cpuIntensive, cpuIntensiveHandler } from "./cpu-intensive.handler.js";
+import { cpuIntensive } from "./cpu-intensive.handler.js";
 import { longRunningHandler } from "./long-running.handler.js";
+
+export const cpuIntensiveHandler = (jobOrPayload) =>
+    cpuIntensive(jobOrPayload?.payload ?? jobOrPayload ?? {});
 
 export const handlers = Object.freeze({
     calculate_primes: calculatePrimes,
     process_json: processJson,
-    cpu_intensive: cpuIntensive,
+    cpu_intensive: cpuIntensiveHandler,
     long_running: longRunningHandler,
     CALCULATE_PRIMES: calculatePrimes,
     PROCESS_JSON: processJson,
-    CPU_INTENSIVE: cpuIntensive,
+    CPU_INTENSIVE: cpuIntensiveHandler,
     LONG_RUNNING: longRunningHandler
 });
 
@@ -32,6 +35,5 @@ export {
     processJson,
     processJsonHandler,
     cpuIntensive,
-    cpuIntensiveHandler,
     longRunningHandler
 };

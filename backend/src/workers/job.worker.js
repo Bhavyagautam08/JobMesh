@@ -136,6 +136,17 @@ async function startWorker() {
                     if (["JOB_CREATED", "JOB_RETRIED", "JOB_REQUEUED"].includes(event.eventType)) {
                         await processEvent(event);
                     }
+                    const testPauseMs = process.env.NODE_ENV === "test"
+                        ? Number(process.env.JOBMESH_TEST_PAUSE_BEFORE_ACK_MS || 0)
+                        : 0;
+                    const testPauseJobId = process.env.JOBMESH_TEST_PAUSE_BEFORE_ACK_JOB_ID;
+                    if (
+                        Number.isFinite(testPauseMs)
+                        && testPauseMs > 0
+                        && (!testPauseJobId || testPauseJobId === event.jobId)
+                    ) {
+                        await new Promise((resolve) => setTimeout(resolve, testPauseMs));
+                    }
                     await acknowledgeJobEvent(event.streamId);
                 }
             }

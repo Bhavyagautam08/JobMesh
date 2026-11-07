@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { test, after, before } from "node:test";
 import { pool } from "../src/config/database.js";
+import { acknowledgeJobEvent, ensureConsumerGroup } from "../src/queue/redis.consumer.js";
+import { publishJobEvent } from "../src/queue/redis.producer.js";
+import { redis } from "../src/config/redis.js";
 import { createJob } from "../src/services/job.service.js";
 import { claimJob } from "../src/services/job.execution.service.js";
 import { completeJob } from "../src/services/job.completion.service.js";
@@ -12,6 +17,8 @@ import { JOB_STATUS } from "../src/utils/job-status.js";
 
 let testUserId;
 const createdJobIds = [];
+let ackRaceWorker;
+let ackRaceStreamId;
 
 before(async () => {
     const userRes = await pool.query(
@@ -31,6 +38,13 @@ async function cleanupJob(jobId) {
 }
 
 after(async () => {
+    if (ackRaceWorker && ackRaceWorker.exitCode === null && ackRaceWorker.signalCode === null) {
+        ackRaceWorker.kill("SIGTERM");
+        await once(ackRaceWorker, "exit");
+    }
+    if (ackRaceStreamId) {
+        await acknowledgeJobEvent(ackRaceStreamId);
+    }
     for (const jobId of createdJobIds) {
         await cleanupJob(jobId);
     }
@@ -351,4 +365,83 @@ test("Test 5: Worker crash injection is recovered by reconciliation and reassign
     console.log(`  - Lock cleared and JOB_REQUEUED event emitted`);
     console.log(`  - Replacement worker claimed and completed job (attempt 2)`);
     console.log(`  - Crash at max attempts correctly marked FAILED (attempt limit respected)`);
+});
+
+test("Worker killed after completing a job but before stream acknowledgment leaves one successful attempt", async () => {
+    await ensureConsumerGroup();
+    const workerId = `worker-ack-race-${randomUUID()}`;
+    const created = await createJob({
+        userId: testUserId,
+        type: "process_json",
+        payload: { ackRace: true },
+        idempotencyKey: `ack-race-${randomUUID()}`
+    });
+    const jobId = created.data.id;
+    createdJobIds.push(jobId);
+
+    ackRaceWorker = spawn(process.execPath, ["src/workers/job.worker.js"], {
+        cwd: process.cwd(),
+        env: {
+            ...process.env,
+            NODE_ENV: "test",
+            WORKER_ID: workerId,
+            JOBMESH_TEST_PAUSE_BEFORE_ACK_MS: "30000",
+            JOBMESH_TEST_PAUSE_BEFORE_ACK_JOB_ID: jobId
+        },
+        stdio: ["ignore", "ignore", "pipe"]
+    });
+    ackRaceWorker.stderr.on("data", (chunk) => process.stderr.write(chunk));
+
+    ackRaceStreamId = await publishJobEvent({
+        id: randomUUID(),
+        event_type: "JOB_CREATED",
+        aggregate_id: jobId,
+        payload: { jobId, type: created.data.type, payload: created.data.payload }
+    });
+
+    const deadline = Date.now() + 20000;
+    let pendingEntry;
+    while (Date.now() < deadline) {
+        const job = await pool.query(
+            "SELECT status, attempt_count FROM jobs WHERE id = $1",
+            [jobId]
+        );
+        if (job.rows[0]?.status === JOB_STATUS.SUCCESS) {
+            const pending = await redis.xpending("job-events", "job-workers", "-", "+", 1000);
+            pendingEntry = pending.find(([streamId]) => streamId === ackRaceStreamId);
+            if (pendingEntry) break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    assert.ok(pendingEntry, "The completed job's stream message must still be pending before the worker is killed");
+    assert.equal(ackRaceWorker.exitCode, null, "The worker must still be alive in the post-completion, pre-ack pause");
+    await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Worker did not exit after SIGTERM")), 5000);
+        ackRaceWorker.once("exit", () => {
+            clearTimeout(timer);
+            resolve();
+        });
+        ackRaceWorker.kill("SIGTERM");
+    });
+
+    const finalJob = await pool.query(
+        "SELECT status, attempt_count FROM jobs WHERE id = $1",
+        [jobId]
+    );
+    const attempts = await pool.query(
+        "SELECT attempt_number, status FROM job_attempts WHERE job_id = $1 ORDER BY attempt_number",
+        [jobId]
+    );
+    const pendingAfterKill = await redis.xpending("job-events", "job-workers", "-", "+", 1000);
+
+    assert.equal(finalJob.rows[0].status, JOB_STATUS.SUCCESS);
+    assert.equal(finalJob.rows[0].attempt_count, 1);
+    assert.equal(attempts.rowCount, 1);
+    assert.equal(attempts.rows[0].attempt_number, 1);
+    assert.equal(attempts.rows[0].status, JOB_STATUS.SUCCESS);
+    assert.ok(
+        pendingAfterKill.some(([streamId]) => streamId === ackRaceStreamId),
+        "The stream entry must remain unacknowledged after the worker is killed"
+    );
 });

@@ -1,10 +1,12 @@
 import autocannon from "autocannon";
 import { randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { availableParallelism } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pool } from "../src/config/database.js";
+import { redis } from "../src/config/redis.js";
 import { createJob } from "../src/services/job.service.js";
 import { claimJob } from "../src/services/job.execution.service.js";
 import { completeJob } from "../src/services/job.completion.service.js";
@@ -14,31 +16,44 @@ import { JOB_STATUS } from "../src/utils/job-status.js";
 
 const directory = dirname(fileURLToPath(import.meta.url));
 const resultsDirectory = join(directory, "results");
-const baseUrl = process.env.BENCHMARK_BASE_URL;
+const localBenchmark = process.argv.includes("--local");
+const focusedBenchmark = process.argv.includes("--focused");
+const baseUrl = process.env.BENCHMARK_BASE_URL || (localBenchmark ? "http://127.0.0.1:5000" : undefined);
 const workerPoolMax = process.env.BENCHMARK_WORKER_POOL_MAX || "2";
 const workerPoolMaxValue = Number(workerPoolMax);
 const runId = `matrix-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${randomUUID().slice(0, 6)}`;
+const postgresContainer = process.env.BENCHMARK_POSTGRES_CONTAINER
+  || (localBenchmark ? "jobmesh-benchmark-postgres" : "distributed-job-postgres");
+const redisContainer = process.env.BENCHMARK_REDIS_CONTAINER
+  || (localBenchmark ? "jobmesh-benchmark-redis" : "redis");
 const report = {
   runId,
   startedAt: new Date().toISOString(),
   environment: {
     baseUrl,
     target: process.env.BENCHMARK_TARGET,
-    postgres: "DATABASE_URL (dedicated staging database)",
-    redis: "Upstash REST (dedicated staging database)",
+    postgres: localBenchmark ? "local Docker PostgreSQL" : "DATABASE_URL (dedicated staging database)",
+    redis: localBenchmark ? "local Docker Redis through benchmark REST adapter" : "Upstash REST (dedicated staging database)",
     workerPoolMax: workerPoolMaxValue,
     ratesPreviouslyCoveredAndSkipped: [1, 5, 10, 20],
     workerProcessesRunLocally: true,
-    hostedApiAndServices: true
+    hostedApiAndServices: !localBenchmark,
+    focusedBenchmark
   },
   scenarios: []
 };
 
 let benchmarkUserId;
 let outboxProcess;
+let apiProcess;
+let redisAdapterProcess;
 let activeWorkers = [];
 let stopping = false;
 let samplingTimer;
+let activeResourceSamples = [];
+let previousProcessSample;
+let backlogSamplingTimer;
+let resourceSampleInFlight = false;
 
 function percentile(values, fraction) {
   if (values.length === 0) return null;
@@ -51,6 +66,13 @@ async function saveReport() {
   const reportPath = join(resultsDirectory, `${runId}.json`);
   await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
   return reportPath;
+}
+
+async function saveScenarioResult(name, result) {
+  await mkdir(resultsDirectory, { recursive: true });
+  const path = join(resultsDirectory, `${runId}-${name}.json`);
+  await writeFile(path, `${JSON.stringify(result, null, 2)}\n`, "utf8");
+  return path;
 }
 
 function spawnNode(script, workerId, extraEnv = {}) {
@@ -93,6 +115,51 @@ async function startOutboxPublisher(env = {}) {
   await new Promise((resolve) => setTimeout(resolve, 500));
   if (outboxProcess.exitCode !== null) throw new Error("Outbox publisher exited during startup");
   return outboxProcess;
+}
+
+async function startRedisRestAdapter() {
+  redisAdapterProcess = spawnNode("benchmarks/local-redis-rest-adapter.js", "local-redis-rest-adapter");
+  const deadline = Date.now() + 15000;
+  let lastError;
+  while (Date.now() < deadline) {
+    if (redisAdapterProcess.exitCode !== null) {
+      throw new Error(`Local Redis REST adapter exited with code ${redisAdapterProcess.exitCode}`);
+    }
+    try {
+      if (await redis.ping() === "PONG") return redisAdapterProcess;
+      lastError = new Error("Redis REST adapter returned an unexpected PING response");
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  throw new Error(`Local Redis REST adapter did not become ready within 15 seconds: ${lastError?.message || "no response"}`);
+}
+
+async function startLocalApi() {
+  apiProcess = spawnNode("server.js", "local-api", {
+    PORT: new URL(baseUrl).port || "5000",
+    DATABASE_URL: process.env.DATABASE_URL,
+    UPSTASH_REDIS_REST_URL: process.env.UPSTASH_REDIS_REST_URL,
+    UPSTASH_REDIS_REST_TOKEN: process.env.UPSTASH_REDIS_REST_TOKEN,
+    RATE_LIMIT_MAX_REQUESTS: "20000"
+  });
+  const deadline = Date.now() + 30000;
+  let lastError;
+  while (Date.now() < deadline) {
+    if (apiProcess.exitCode !== null) {
+      throw new Error(`Local API exited with code ${apiProcess.exitCode}`);
+    }
+    try {
+      const response = await fetch(new URL("/api/ready", baseUrl));
+      if (response.ok) return apiProcess;
+      lastError = new Error(`API readiness endpoint returned HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`Local API did not become ready within 30 seconds: ${lastError?.message || "no response"}`);
 }
 
 async function startWorkers(count, prefix = "matrix-worker") {
@@ -232,7 +299,7 @@ async function waitForCompletion(prefix, expected, timeoutMs = 300000, onSample 
   throw new Error(`Timed out after ${timeoutMs}ms waiting for ${latestCount}/${expected} terminal jobs in ${prefix}`);
 }
 
-async function waitForOutbox(prefix, timeoutMs = 120000) {
+async function waitForOutbox(prefix, timeoutMs = 600000) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     const result = await pool.query(
@@ -241,7 +308,9 @@ async function waitForOutbox(prefix, timeoutMs = 120000) {
          AND published = FALSE`,
       [prefix]
     );
-    if (result.rows[0].count === 0) return;
+    if (result.rows[0].count === 0) {
+      return { elapsedMs: Date.now() - startedAt, pendingEvents: 0 };
+    }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`Outbox events for ${prefix} were not published before timeout`);
@@ -463,73 +532,240 @@ async function seedJobs(prefix, specs) {
   return ids;
 }
 
-function sampleWorkerResources(workerProcesses) {
-  const ids = workerProcesses.map(({ pid }) => pid).filter(Number.isInteger);
-  if (!ids.length) return null;
-  const script = `$pids=@(${ids.join(",")}); Get-Process -Id $pids -ErrorAction SilentlyContinue | Select-Object Id,CPU,WorkingSet64 | ConvertTo-Json -Compress`;
-  const sample = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-    encoding: "utf8",
-    timeout: 10000
+function parseDockerBytes(value) {
+  const match = value.match(/([\d.]+)\s*(B|KiB|MiB|GiB)/i);
+  if (!match) return null;
+  const multiplier = { B: 1, KiB: 1024, MiB: 1024 ** 2, GiB: 1024 ** 3 }[match[2]];
+  return Math.round(Number(match[1]) * multiplier);
+}
+
+function runCommand(executable, args, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, { windowsHide: true });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill();
+      settled = true;
+      reject(new Error(`${executable} exceeded ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `${executable} exited with code ${code} (${signal || "no signal"})`));
+      } else {
+        resolve({ stdout, stderr });
+      }
+    });
   });
-  if (sample.status !== 0 || !sample.stdout.trim()) return null;
+}
+
+async function sampleLocalResources() {
+  const processIds = [apiProcess, ...activeWorkers]
+    .filter((child) => child && child.exitCode === null)
+    .map(({ pid }) => pid)
+    .filter(Number.isInteger);
+  const sample = { timestamp: null, api: null, workers: [], postgres: null, redis: null };
+  if (!processIds.length) {
+    sample.timestamp = new Date().toISOString();
+    sample.sampleError = "No API or worker processes were available to sample";
+    return sample;
+  }
+
+  const processScript = `$pids=@(${processIds.join(",")}); Get-Process -Id $pids -ErrorAction SilentlyContinue | Select-Object Id,CPU,WorkingSet64 | ConvertTo-Json -Compress`;
+  const dockerArgs = [
+    "stats", "--no-stream", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}",
+    postgresContainer, redisContainer
+  ];
+  const [processOutcome, dockerOutcome] = await Promise.all([
+    runCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", processScript], 10000)
+      .then((result) => ({ result }))
+      .catch((error) => ({ error })),
+    runCommand("docker", dockerArgs, 15000)
+      .then((result) => ({ result }))
+      .catch((error) => ({ error }))
+  ]);
+  if (processOutcome.error) {
+    sample.processSampleError = processOutcome.error.message;
+  } else if (!processOutcome.result.stdout.trim()) {
+    sample.processSampleError = "PowerShell returned no process resource data";
+  } else {
+    try {
+      const rows = JSON.parse(processOutcome.result.stdout);
+      const previousTime = previousProcessSample?.timeMs;
+      const elapsedSeconds = previousTime ? (Date.now() - previousTime) / 1000 : null;
+      const previousByPid = new Map((previousProcessSample?.processes || []).map((item) => [item.pid, item.cpuSeconds]));
+      const processes = (Array.isArray(rows) ? rows : [rows]).map((row) => {
+        const pid = Number(row.Id);
+        const cpuSeconds = Number(row.CPU || 0);
+        const previousCpuSeconds = previousByPid.get(pid);
+        return {
+          pid,
+          cpuSeconds,
+          cpuPercentOfHost: elapsedSeconds && previousCpuSeconds !== undefined
+            ? Number((((cpuSeconds - previousCpuSeconds) / elapsedSeconds / availableParallelism()) * 100).toFixed(3))
+            : null,
+          workingSetBytes: Number(row.WorkingSet64 || 0)
+        };
+      });
+      previousProcessSample = {
+        timeMs: Date.now(),
+        processes: processes.map(({ pid, cpuSeconds }) => ({ pid, cpuSeconds }))
+      };
+      const apiPid = apiProcess?.pid;
+      sample.api = processes.find(({ pid }) => pid === apiPid) || null;
+      sample.workers = processes.filter(({ pid }) => activeWorkers.some((worker) => worker.pid === pid));
+    } catch (error) {
+      sample.processSampleError = `Unable to parse process resource sample: ${error.message}`;
+    }
+  }
+
+  if (dockerOutcome.error) {
+    sample.containerSampleError = dockerOutcome.error.message;
+  } else {
+    for (const line of dockerOutcome.result.stdout.trim().split(/\r?\n/).filter(Boolean)) {
+      const [name, cpu, memory] = line.split("|");
+      const [usedMemory, memoryLimit] = (memory || "").split("/").map((part) => part.trim());
+      const containerSample = {
+        cpuPercent: Number.parseFloat(cpu),
+        memoryUsedBytes: usedMemory ? parseDockerBytes(usedMemory) : null,
+        memoryLimitBytes: memoryLimit ? parseDockerBytes(memoryLimit) : null,
+        memoryUsage: memory || null
+      };
+      if (name === postgresContainer || name === postgresContainer.replace(/^\//, "")) sample.postgres = containerSample;
+      if (name === redisContainer || name === redisContainer.replace(/^\//, "")) sample.redis = containerSample;
+    }
+    if (!sample.postgres || !sample.redis) {
+      sample.containerSampleError = `docker stats did not return both ${postgresContainer} and ${redisContainer}`;
+    }
+  }
+  sample.timestamp = new Date().toISOString();
+  return sample;
+}
+
+async function captureResourceSample() {
+  if (resourceSampleInFlight) return;
+  resourceSampleInFlight = true;
   try {
-    const rows = JSON.parse(sample.stdout);
-    return (Array.isArray(rows) ? rows : [rows]).map((row) => ({
-      pid: row.Id,
-      cpuSeconds: Number(row.CPU || 0),
-      workingSetBytes: Number(row.WorkingSet64 || 0)
-    }));
-  } catch (error) {
-    console.error("Unable to parse worker process resource sample:", error.message);
-    return null;
+    activeResourceSamples.push(await sampleLocalResources());
+  } finally {
+    resourceSampleInFlight = false;
   }
 }
 
-async function runWorkerScaling(count, results) {
-  const prefix = `benchmark:${runId}:scale-${count}:`;
-  const specs = Array.from({ length: 240 }, (_, index) => {
-    if (index % 3 === 0) return { type: "process_json", payload: { data: { sequence: index } } };
-    if (index % 3 === 1) return { type: "long_running", payload: { durationMs: 100 } };
-    return { type: "cpu_intensive", payload: { iterations: 400000 } };
+async function startResourceSampling() {
+  activeResourceSamples = [];
+  previousProcessSample = undefined;
+  await captureResourceSample();
+  samplingTimer = setInterval(() => {
+    void captureResourceSample().catch((error) =>
+      console.error("Local process/container sampling failed:", error.message)
+    );
+  }, 1000);
+}
+
+async function stopResourceSampling(name) {
+  if (samplingTimer) clearInterval(samplingTimer);
+  samplingTimer = undefined;
+  while (resourceSampleInFlight) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  await captureResourceSample();
+  const samples = activeResourceSamples;
+  const path = await saveScenarioResult(`${name}-resource-samples`, samples);
+  return { samples, path };
+}
+
+function summarizeResourceSampling(samples, expectedWorkerCount) {
+  const intervals = samples.slice(1).map((sample, index) =>
+    new Date(sample.timestamp) - new Date(samples[index].timestamp)
+  );
+  const errors = samples.flatMap((sample, index) => {
+    const sampleErrors = [];
+    if (sample.processSampleError) sampleErrors.push(`sample ${index + 1}: ${sample.processSampleError}`);
+    if (sample.containerSampleError) sampleErrors.push(`sample ${index + 1}: ${sample.containerSampleError}`);
+    if (!sample.api || sample.workers.length !== expectedWorkerCount) {
+      sampleErrors.push(`sample ${index + 1}: expected API and ${expectedWorkerCount} worker process samples`);
+    }
+    if (!sample.postgres || !sample.redis) {
+      sampleErrors.push(`sample ${index + 1}: expected PostgreSQL and Redis container samples`);
+    }
+    return sampleErrors;
   });
+  const maxIntervalMs = intervals.length ? Math.max(...intervals) : null;
+  return {
+    targetIntervalMs: 1000,
+    sampleCount: samples.length,
+    maxIntervalMs,
+    errors,
+    passed: samples.length > 1 && errors.length === 0 && maxIntervalMs <= 2500
+  };
+}
+
+async function runWorkerScaling(count, handlerType, results) {
+  const prefix = `benchmark:${runId}:scale-${handlerType}-${count}:`;
+  const specs = Array.from({ length: 240 }, (_, index) => handlerType === "long_running"
+    ? { type: handlerType, payload: { durationMs: 100 } }
+    : { type: handlerType, payload: { iterations: 400000 } });
   await seedJobs(prefix, specs);
-  await waitForOutbox(prefix);
+  report.activeScenario = { category: "worker-scaling", workerCount: count, handlerType, phase: "waiting-for-outbox" };
+  await saveReport();
+  try {
+    await waitForOutbox(prefix, 600000);
+  } catch (error) {
+    report.activeScenario.error = error.message;
+    await saveReport();
+    throw error;
+  }
+  report.activeScenario.phase = "running-workers";
+  await saveReport();
   await ensureConsumerGroup();
   const workers = await startWorkers(count, `scale-${count}`);
-  const cpuStart = sampleWorkerResources(workers);
+  if (localBenchmark) await startResourceSampling();
   const start = performance.now();
   const completion = await waitForCompletion(prefix, specs.length, 240000);
-  const cpuEnd = sampleWorkerResources(workers);
+  const executionWallMs = performance.now() - start;
+  const resourceCollection = localBenchmark
+    ? await stopResourceSampling(`scale-${handlerType}-${count}`)
+    : { samples: [], path: null };
   const metrics = await databaseMetrics(prefix);
   await stopWorkers();
-  const startByPid = new Map((cpuStart || []).map((sample) => [sample.pid, sample]));
-  const resources = (cpuEnd || []).map((sample) => {
-    const initial = startByPid.get(sample.pid);
-    return {
-      pid: sample.pid,
-      cpuSeconds: initial ? Number((sample.cpuSeconds - initial.cpuSeconds).toFixed(3)) : null,
-      workingSetBytesAtEnd: sample.workingSetBytes
-    };
-  });
+  const resourceSampling = localBenchmark
+    ? summarizeResourceSampling(resourceCollection.samples, count)
+    : { targetIntervalMs: null, sampleCount: 0, maxIntervalMs: null, errors: [], passed: true };
   const result = {
     category: "worker-scaling",
     workerCount: count,
-    workload: { totalJobs: specs.length, lightweightProcessJson: 80, longRunning100ms: 80, cpuIntensive400k: 80 },
-    executionWallMs: Number((performance.now() - start).toFixed(3)),
+    handlerType,
+    workload: { totalJobs: specs.length, handlerType, payload: handlerType === "long_running" ? { durationMs: 100 } : { iterations: 400000 } },
+    executionWallMs: Number(executionWallMs.toFixed(3)),
+    executionThroughputJobsPerSecond: Number((specs.length / (executionWallMs / 1000)).toFixed(3)),
     jobMetrics: metrics,
     maxDatabaseConnections: completion.maxDatabaseConnections,
-    processResources: {
-      samplesCollected: resources.length,
-      workers: resources,
-      cpuSecondsTotal: resources.some(({ cpuSeconds }) => cpuSeconds !== null)
-        ? Number(resources.reduce((total, worker) => total + (worker.cpuSeconds || 0), 0).toFixed(3))
-        : null,
-      workingSetBytesTotalAtEnd: resources.length
-        ? resources.reduce((total, worker) => total + worker.workingSetBytesAtEnd, 0)
-        : null
-    }
+    resourceSamples: resourceCollection.samples,
+    resourceSamplesPath: resourceCollection.path,
+    resourceSampling,
+    passed: metrics.jobs === specs.length
+      && metrics.succeeded === specs.length
+      && metrics.failed === 0
+      && resourceSampling.passed
   };
+  delete report.activeScenario;
   results.push(result);
+  await saveScenarioResult(`scale-${handlerType}-${count}`, result);
   await saveReport();
   return result;
 }
@@ -538,6 +774,13 @@ async function runSustainedLoad(cookie, results) {
   const rate = 10;
   const count = 3000;
   const prefix = `benchmark:${runId}:sustained:`;
+  report.activeScenario = {
+    category: "sustained-load",
+    phase: "submitting",
+    requestedJobs: count,
+    targetRequestsPerSecond: rate
+  };
+  await saveReport();
   const responseLatency = [];
   const samples = [];
   const startedAt = new Date().toISOString();
@@ -545,7 +788,7 @@ async function runSustainedLoad(cookie, results) {
   const pollResources = async () => {
     if (stopping) return;
     try {
-      const [counts, pgConnections, apiResponse] = await Promise.all([
+      const [counts, pgConnections] = await Promise.all([
         pool.query(
           `SELECT COUNT(*) FILTER (WHERE status = 'QUEUED')::int AS queued,
                   COUNT(*) FILTER (WHERE status = 'RUNNING')::int AS running,
@@ -554,15 +797,20 @@ async function runSustainedLoad(cookie, results) {
            FROM jobs WHERE LEFT(idempotency_key, LENGTH($1)) = $1`,
           [prefix]
         ),
-        pool.query("SELECT COUNT(*)::int AS count FROM pg_stat_activity WHERE datname = current_database()"),
-        fetch(new URL("/api/metrics", baseUrl), { headers: { Cookie: cookie } })
+        pool.query("SELECT COUNT(*)::int AS count FROM pg_stat_activity WHERE datname = current_database()")
       ]);
-      const apiMetrics = await apiResponse.json();
+      let apiRssBytes = null;
+      if (!localBenchmark) {
+        const apiResponse = await fetch(new URL("/api/metrics", baseUrl), { headers: { Cookie: cookie } });
+        if (!apiResponse.ok) throw new Error(`API metrics endpoint returned HTTP ${apiResponse.status}`);
+        const apiMetrics = await apiResponse.json();
+        apiRssBytes = apiMetrics.metrics?.memory?.rss ?? null;
+      }
       samples.push({
         timestamp: new Date().toISOString(),
         ...counts.rows[0],
         activeDatabaseConnections: pgConnections.rows[0].count,
-        apiRssBytes: apiMetrics.metrics?.memory?.rss ?? null
+        apiRssBytes
       });
     } catch (error) {
       console.error("Sustained-load resource sampling failed:", error.message);
@@ -571,7 +819,8 @@ async function runSustainedLoad(cookie, results) {
   };
   stopping = false;
   await pollResources();
-  samplingTimer = setInterval(() => void pollResources(), 5000);
+  if (localBenchmark) await startResourceSampling();
+  backlogSamplingTimer = setInterval(() => void pollResources(), 5000);
   const tracker = autocannon({
     url: baseUrl,
     connections: rate,
@@ -582,9 +831,8 @@ async function runSustainedLoad(cookie, results) {
   });
   tracker.on("response", (_client, _statusCode, _responseBytes, latencyMs) => responseLatency.push(latencyMs));
   const http = await tracker;
-  stopping = true;
-  clearInterval(samplingTimer);
-  samplingTimer = undefined;
+  clearInterval(backlogSamplingTimer);
+  backlogSamplingTimer = undefined;
   await pollResources();
   const persisted = await pool.query(
     "SELECT COUNT(*)::int AS count FROM jobs WHERE LEFT(idempotency_key, LENGTH($1)) = $1",
@@ -592,6 +840,8 @@ async function runSustainedLoad(cookie, results) {
   );
   if (persisted.rows[0].count !== count) throw new Error(`Sustained run persisted ${persisted.rows[0].count}/${count} jobs`);
   const drainStartedAt = Date.now();
+  report.activeScenario.phase = "waiting-for-completion";
+  await saveReport();
   const drain = await waitForCompletion(prefix, count, 600000, async (counts) => {
     const completed = counts.success;
     for (const threshold of [50, 95, 100]) {
@@ -603,11 +853,34 @@ async function runSustainedLoad(cookie, results) {
     }
   });
   const jobMetrics = await databaseMetrics(prefix);
+  const handlerCountsResult = await pool.query(
+    `SELECT type, COUNT(*)::int AS count
+     FROM jobs WHERE LEFT(idempotency_key, LENGTH($1)) = $1
+     GROUP BY type ORDER BY type`,
+    [prefix]
+  );
+  const resourceCollection = localBenchmark
+    ? await stopResourceSampling("sustained")
+    : { samples: [], path: null };
+  const processResourceSampling = localBenchmark
+    ? summarizeResourceSampling(resourceCollection.samples, 4)
+    : { targetIntervalMs: null, sampleCount: 0, maxIntervalMs: null, errors: [], passed: true };
+  const submissionRate = http.duration > 0
+    ? Number((http.requests.total / http.duration).toFixed(3))
+    : null;
   const result = {
     category: "sustained-load",
     targetRequestsPerSecond: rate,
     durationSeconds: Number(http.duration.toFixed(3)),
     requestedJobs: count,
+    submittedJobs: http.requests.total,
+    submissionRateJobsPerSecond: submissionRate,
+    workerCompletionRateJobsPerSecond: jobMetrics.completionThroughputJobsPerSecond,
+    submissionToWorkerRateRatio: submissionRate && jobMetrics.completionThroughputJobsPerSecond
+      ? Number((submissionRate / jobMetrics.completionThroughputJobsPerSecond).toFixed(3))
+      : null,
+    handlerType: "mixed",
+    handlerCounts: Object.fromEntries(handlerCountsResult.rows.map(({ type, count: jobCount }) => [type, jobCount])),
     startedAt,
     endedAt: new Date().toISOString(),
     responseLatencyMs: {
@@ -625,6 +898,7 @@ async function runSustainedLoad(cookie, results) {
       non2xx: http.non2xx
     },
     jobMetrics,
+    outboxDrain: { status: "pending" },
     backlogDrain: {
       startedAfterProducerStopped: true,
       milestonesMs: { ...report.backlogDrain.milestonesMs },
@@ -632,14 +906,22 @@ async function runSustainedLoad(cookie, results) {
       maxDatabaseConnectionsWhileDraining: drain.maxDatabaseConnections
     },
     resourceSamples: samples,
+    processAndContainerResourceSamples: resourceCollection.samples,
+    processAndContainerResourceSamplesPath: resourceCollection.path,
+    processAndContainerResourceSampling: processResourceSampling,
     resourceSummary: {
       samples: samples.length,
-      maxApiRssBytes: Math.max(0, ...samples.map((sample) => sample.apiRssBytes || 0)),
+      maxApiRssBytes: Math.max(0, ...(
+        localBenchmark
+          ? resourceCollection.samples.map((sample) => sample.api?.workingSetBytes || 0)
+          : samples.map((sample) => sample.apiRssBytes || 0)
+      )),
       maxActiveDatabaseConnections: Math.max(0, ...samples.map((sample) => sample.activeDatabaseConnections || 0)),
       maxQueuedJobs: Math.max(0, ...samples.map((sample) => sample.queued || 0)),
       maxRunningJobs: Math.max(0, ...samples.map((sample) => sample.running || 0))
     }
   };
+  delete report.activeScenario;
   results.push(result);
   report.backlogDrain = result.backlogDrain;
   result.passed = http.requests.total === count
@@ -648,7 +930,24 @@ async function runSustainedLoad(cookie, results) {
     && http.timeouts === 0
     && jobMetrics.succeeded === count
     && samples.every((sample) => !sample.sampleError)
+    && processResourceSampling.passed
     && [50, 95, 100].every((threshold) => result.backlogDrain.milestonesMs[String(threshold)] !== null);
+  await saveScenarioResult("sustained", result);
+  await saveReport();
+  try {
+    result.outboxDrain = {
+      status: "complete",
+      ...(await waitForOutbox(prefix, 600000))
+    };
+  } catch (error) {
+    result.outboxDrain = { status: "timed_out", error: error.message };
+    result.passed = false;
+    await saveScenarioResult("sustained", result);
+    await saveReport();
+    throw error;
+  }
+  await saveScenarioResult("sustained", result);
+  result.resourceSamplesPath = resourceCollection.path;
   await saveReport();
   if (!result.passed) throw new Error("Sustained-load outcome or resource-sampling invariant failed");
   return result;
@@ -694,68 +993,149 @@ async function runDuplicateDelivery(results) {
   return result;
 }
 
+function validateLocalBenchmarkConfig() {
+  if (!process.argv.includes("--confirm-local-benchmark")) {
+    throw new Error("Pass --confirm-local-benchmark to confirm that local benchmark data may be written.");
+  }
+  if (process.env.BENCHMARK_TARGET !== "local") {
+    throw new Error("Set BENCHMARK_TARGET=local for the isolated local benchmark.");
+  }
+  for (const [name, value] of [
+    ["BENCHMARK_BASE_URL", baseUrl],
+    ["DATABASE_URL", process.env.DATABASE_URL],
+    ["UPSTASH_REDIS_REST_URL", process.env.UPSTASH_REDIS_REST_URL]
+  ]) {
+    if (!value) throw new Error(`${name} is required for a local benchmark.`);
+  }
+  const apiUrl = new URL(baseUrl);
+  const databaseUrl = new URL(process.env.DATABASE_URL);
+  const redisRestUrl = new URL(process.env.UPSTASH_REDIS_REST_URL);
+  const localHosts = new Set(["127.0.0.1", "localhost", "::1"]);
+  if (apiUrl.protocol !== "http:" || !localHosts.has(apiUrl.hostname) || apiUrl.port !== "5000") {
+    throw new Error("Local BENCHMARK_BASE_URL must use HTTP on loopback port 5000.");
+  }
+  if (
+    !localHosts.has(databaseUrl.hostname)
+    || databaseUrl.port !== "55432"
+    || databaseUrl.username !== "jobmesh_benchmark"
+    || databaseUrl.pathname !== "/jobmesh_benchmark"
+  ) {
+    throw new Error("Local DATABASE_URL must point to the isolated benchmark PostgreSQL service on port 55432.");
+  }
+  if (
+    redisRestUrl.protocol !== "http:"
+    || !localHosts.has(redisRestUrl.hostname)
+    || redisRestUrl.port !== "8079"
+  ) {
+    throw new Error("Local UPSTASH_REDIS_REST_URL must point to the loopback benchmark adapter on port 8079.");
+  }
+  const localRedisUrl = new URL(process.env.BENCHMARK_REDIS_URL || "redis://127.0.0.1:56379");
+  if (!localHosts.has(localRedisUrl.hostname) || localRedisUrl.port !== "56379") {
+    throw new Error("BENCHMARK_REDIS_URL must point to the isolated benchmark Redis service on port 56379.");
+  }
+}
+
+async function initializeLocalDatabase() {
+  const schema = await readFile(new URL("../db/schema.sql", import.meta.url), "utf8");
+  await pool.query(schema);
+}
+
+function collectHostSpecs() {
+  const command = "$cpu=Get-CimInstance Win32_Processor | Select-Object -First 1; "
+    + "$os=Get-CimInstance Win32_OperatingSystem; "
+    + "[pscustomobject]@{CPU=$cpu.Name; Cores=$cpu.NumberOfCores; "
+    + "LogicalProcessors=$cpu.NumberOfLogicalProcessors; "
+    + "MemoryBytes=([int64]$os.TotalVisibleMemorySize * 1KB); "
+    + "OS=$os.Caption; Version=$os.Version} | ConvertTo-Json -Compress";
+  const host = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
+    encoding: "utf8",
+    timeout: 10000
+  });
+  if (host.status !== 0 || !host.stdout.trim()) {
+    throw new Error(`Could not collect benchmark host information: ${host.stderr || host.status}`);
+  }
+  return JSON.parse(host.stdout);
+}
+
 async function main() {
   if (process.argv.includes("--help") || process.argv.includes("-h")) {
     console.log("Run with BENCHMARK_TARGET=staging and BENCHMARK_BASE_URL=https://<staging-api> npm run bench:matrix -- --confirm-staging-benchmark");
     console.log("DATABASE_URL and Upstash REST credentials must point to dedicated non-production staging services.");
+    console.log("For a single-host run, use BENCHMARK_TARGET=local with loopback database/REST URLs and pass --local --focused --confirm-local-benchmark.");
     return;
   }
-  if (process.env.BENCHMARK_TARGET !== "staging" || !process.argv.includes("--confirm-staging-benchmark")) {
-    throw new Error("Set BENCHMARK_TARGET=staging and pass --confirm-staging-benchmark; use dedicated, non-production PostgreSQL, Upstash Redis, and API services.");
+  if (localBenchmark) {
+    validateLocalBenchmarkConfig();
+    if (!Number.isInteger(workerPoolMaxValue) || workerPoolMaxValue < 1) {
+      throw new Error("BENCHMARK_WORKER_POOL_MAX must be a positive integer");
+    }
+    await initializeLocalDatabase();
+    await startRedisRestAdapter();
+    await startLocalApi();
+  } else {
+    if (process.env.BENCHMARK_TARGET !== "staging" || !process.argv.includes("--confirm-staging-benchmark")) {
+      throw new Error("Set BENCHMARK_TARGET=staging and pass --confirm-staging-benchmark; use dedicated, non-production PostgreSQL, Upstash Redis, and API services.");
+    }
+    if (!baseUrl) throw new Error("Set BENCHMARK_BASE_URL to the hosted staging API URL.");
+    const apiUrl = new URL(baseUrl);
+    if (apiUrl.protocol !== "https:") throw new Error("BENCHMARK_BASE_URL must use HTTPS for hosted staging.");
+    const readiness = await fetch(new URL("/api/ready", baseUrl));
+    if (!readiness.ok) throw new Error(`Hosted staging API is not ready: HTTP ${readiness.status}`);
   }
   if (!Number.isInteger(workerPoolMaxValue) || workerPoolMaxValue < 1) {
     throw new Error("BENCHMARK_WORKER_POOL_MAX must be a positive integer");
   }
-  if (!baseUrl) throw new Error("Set BENCHMARK_BASE_URL to the hosted staging API URL.");
-  const apiUrl = new URL(baseUrl);
-  if (apiUrl.protocol !== "https:") throw new Error("BENCHMARK_BASE_URL must use HTTPS for hosted staging.");
-  const readiness = await fetch(new URL("/api/ready", baseUrl));
-  if (!readiness.ok) throw new Error(`Hosted staging API is not ready: HTTP ${readiness.status}`);
   await ensureConsumerGroup();
   const cookie = await registerBenchmarkAccount();
-  const host = spawnSync("powershell.exe", [
-    "-NoProfile", "-NonInteractive", "-Command",
-    "(Get-CimInstance Win32_Processor | Select-Object -First 1 Name,NumberOfCores,NumberOfLogicalProcessors | ConvertTo-Json -Compress)"
-  ], { encoding: "utf8", timeout: 10000 });
-  if (host.status !== 0) throw new Error(`Could not collect benchmark host information: ${host.stderr}`);
-  report.environment.host = host.stdout.trim();
+  report.environment.host = collectHostSpecs();
+  report.environment.sourceCommit = spawnSync("git", ["rev-parse", "HEAD"], {
+    cwd: join(directory, "..", ".."),
+    encoding: "utf8"
+  }).stdout.trim();
   report.resultsPath = join(resultsDirectory, `${runId}.json`);
   await saveReport();
 
-  await startWorkers(4, "load-ramp-worker");
+  if (!focusedBenchmark) await startWorkers(4, "load-ramp-worker");
   await startOutboxPublisher();
 
-  for (const rate of [25, 50]) {
-    await runLoadRate(rate, 500, cookie, report.scenarios);
-  }
+  if (!focusedBenchmark) {
+    for (const rate of [25, 50]) {
+      await runLoadRate(rate, 500, cookie, report.scenarios);
+    }
 
-  await stopWorkers();
-  for (const concurrency of [100, 250]) {
-    await runIdempotencyContention(concurrency, cookie, report.scenarios);
-    await runClaimContention(concurrency, report.scenarios);
+    await stopWorkers();
+    for (const concurrency of [100, 250]) {
+      await runIdempotencyContention(concurrency, report.scenarios);
+      await runClaimContention(concurrency, report.scenarios);
+    }
   }
 
   for (const count of [1, 2, 4, 8, 16]) {
-    await runWorkerScaling(count, report.scenarios);
+    for (const handlerType of ["long_running", "cpu_intensive"]) {
+      await runWorkerScaling(count, handlerType, report.scenarios);
+    }
   }
 
   await startWorkers(4, "sustained-worker");
   report.backlogDrain = { milestonesMs: { "50": null, "95": null, "100": null } };
   await runSustainedLoad(cookie, report.scenarios);
 
-  await runDuplicateDelivery(report.scenarios);
+  if (!focusedBenchmark) await runDuplicateDelivery(report.scenarios);
 
-  const singleWorkerThroughput = report.scenarios.find((scenario) =>
-    scenario.category === "worker-scaling" && scenario.workerCount === 1
-  )?.jobMetrics.completionThroughputJobsPerSecond;
   for (const scenario of report.scenarios.filter((item) => item.category === "worker-scaling")) {
-    const throughput = scenario.jobMetrics.completionThroughputJobsPerSecond;
-    scenario.speedup = singleWorkerThroughput && throughput
+    const singleWorkerThroughput = report.scenarios.find((item) =>
+      item.category === "worker-scaling"
+      && item.handlerType === scenario.handlerType
+      && item.workerCount === 1
+    )?.executionThroughputJobsPerSecond;
+    const throughput = scenario.executionThroughputJobsPerSecond;
+    scenario.speedup = singleWorkerThroughput
       ? Number((throughput / singleWorkerThroughput).toFixed(3))
       : null;
-    scenario.scalingEfficiencyPct = singleWorkerThroughput && throughput
+    scenario.scalingEfficiencyPct = singleWorkerThroughput
       ? Number((throughput / (scenario.workerCount * singleWorkerThroughput) * 100).toFixed(2))
       : null;
+    await saveScenarioResult(`scale-${scenario.handlerType}-${scenario.workerCount}`, scenario);
   }
   report.completedAt = new Date().toISOString();
   report.passed = report.scenarios.every((scenario) => scenario.passed !== false);
@@ -777,6 +1157,7 @@ async function main() {
 process.on("SIGINT", () => {
   stopping = true;
   if (samplingTimer) clearInterval(samplingTimer);
+  if (backlogSamplingTimer) clearInterval(backlogSamplingTimer);
   process.exitCode = 130;
 });
 
@@ -791,7 +1172,10 @@ main()
   .finally(async () => {
     stopping = true;
     if (samplingTimer) clearInterval(samplingTimer);
+    if (backlogSamplingTimer) clearInterval(backlogSamplingTimer);
     await stopWorkers();
     await stopProcess(outboxProcess);
+    await stopProcess(apiProcess);
+    await stopProcess(redisAdapterProcess);
     await pool.end();
   });

@@ -1,0 +1,17 @@
+services:
+  benchmark-postgres:
+    image: postgres:16
+    container_name: jobmesh-benchmark-postgres
+    environment:
+      POSTGRES_USER: jobmesh_benchmark
+      POSTGRES_PASSWORD: ${BENCHMARK_POSTGRES_PASSWORD:?Set a disposable local benchmark password}
+      POSTGRES_DB: jobmesh_benchmark
+    ports:
+      - "127.0.0.1:55432:5432"
+
+  benchmark-redis:
+    image: redis:8.10.1
+    container_name: jobmesh-benchmark-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:56379:6379"
