@@ -35,7 +35,7 @@ export default function AuthPage() {
       <section className="auth-card" aria-labelledby="auth-title">
         <Link className="auth-brand" to="/" aria-label="JobMesh home">
           <span className="auth-brand-mark"><i /><i /><i /></span>
-          <span><strong>JobMesh</strong><small>Distributed Job Processing</small></span>
+          <span><strong>JobMesh</strong><small>Fault-Tolerant Job Queue</small></span>
         </Link>
         <div className="auth-heading">
           <p className="auth-eyebrow">SECURE WORKSPACE</p>

@@ -71,7 +71,7 @@ export default function CreateJob() {
 
   return <div className="jd-shell">
     <aside className="jd-sidebar">
-      <div className="jd-brand"><div className="brand-mark"><span /><span /><span /></div><div><strong>JobMesh</strong><small>DISTRIBUTED RUNTIME</small></div></div>
+      <div className="jd-brand"><div className="brand-mark"><span /><span /><span /></div><div><strong>JobMesh</strong><small>MULTI-PROCESS RUNTIME</small></div></div>
       <nav>
         <div className="nav-label">CONTROL PLANE</div>
         {navItems.map((item) => <Link to={item.to} key={item.name} className={`nav-item ${item.name === "Jobs" ? "active" : ""}`}>
@@ -98,7 +98,7 @@ export default function CreateJob() {
             <div className="title-row">
               <h1>Create Job</h1>
             </div>
-            <div className="subtitle" style={{ fontSize: '1rem', color: '#888' }}>Submit a new job to the distributed processing system.</div>
+            <div className="subtitle" style={{ fontSize: '1rem', color: '#888' }}>Submit a new job to the fault-tolerant job queue.</div>
           </div>
         </div>
 

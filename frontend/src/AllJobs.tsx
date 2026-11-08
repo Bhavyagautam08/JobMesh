@@ -248,7 +248,7 @@ function AllJobs() {
     <Sidebar/><div className="workspace"><Topbar lastSync={lastSync}/>
     <main className="content">
       <div className="page-header">
-        <div><div className="eyebrow"><span className="live-dot"/>LIVE {activeWorkers > 0 && <span>{activeWorkers} job{activeWorkers !== 1 ? 's' : ''} running</span>}</div><h1>Jobs</h1><p>Inspect, filter and manage distributed job execution.</p></div>
+        <div><div className="eyebrow"><span className="live-dot"/>LIVE {activeWorkers > 0 && <span>{activeWorkers} job{activeWorkers !== 1 ? 's' : ''} running</span>}</div><h1>Jobs</h1><p>Inspect, filter and manage multi-process job execution.</p></div>
         <div className="header-actions"><button className="secondary" onClick={() => void fetchJobs()} disabled={loading}><Icon name="refresh"/>Refresh</button><button className="primary" onClick={() => navigate("/jobs/create")}><Icon name="plus"/>Create Job</button></div>
       </div>
       {loadError && <div className="panel" role="alert" style={{ padding: "1rem", marginBottom: "1rem", color: "var(--red)" }}>{loadError}</div>}
@@ -292,7 +292,7 @@ function AllJobs() {
           <table>
             <thead><tr>
               <th className="check-cell"><input type="checkbox" checked={filtered.length > 0 && filtered.every(j => selected.has(j.id))} onChange={() => filtered.every(j => selected.has(j.id)) ? setSelected(new Set()) : setSelected(new Set(filtered.map(j => j.id)))}/></th>
-              <th>STATUS</th><th>JOB ID</th><th>TYPE</th><th>PRIORITY</th><th title="Attempt count: Number of execution attempts made by workers.">ATTEMPT</th><th title="Distributed worker currently responsible for execution.">WORKER</th><th title="Time at which the job becomes eligible for execution.">SCHEDULED</th>
+              <th>STATUS</th><th>JOB ID</th><th>TYPE</th><th>PRIORITY</th><th title="Attempt count: Number of execution attempts made by workers.">ATTEMPT</th><th title="Worker process currently responsible for execution.">WORKER</th><th title="Time at which the job becomes eligible for execution.">SCHEDULED</th>
               <th><button className="sort" onClick={() => setSort(sort === "desc" ? "asc" : sort === "asc" ? "default" : "desc")}>CREATED {sort === "desc" ? "↓" : sort === "asc" ? "↑" : ""}</button></th><th>DURATION</th><th>UPDATED</th><th/>
             </tr></thead>
             <tbody>{filtered.map(job => <tr key={job.id} className={job.updated === "now" ? "just-updated" : ""} onClick={() => navigate(`/jobs/${job.id}`)} style={{ cursor: 'pointer' }}>

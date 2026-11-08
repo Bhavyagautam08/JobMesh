@@ -79,7 +79,7 @@ export default function GlobalLayout() {
       <aside className="shared-sidebar">
         <Link className="shared-brand" to="/" aria-label="JobMesh Command Center">
           <span className="shared-brand-mark"><i /><i /><i /></span>
-          <span><strong>JobMesh</strong><small>Distributed Job Processing</small></span>
+          <span><strong>JobMesh</strong><small>Fault-Tolerant Job Queue</small></span>
         </Link>
         <nav aria-label="Main navigation">
           {navigation.map((section) => (

@@ -1,4 +1,6 @@
 {
+  "name": "jobmesh",
+  "description": "Fault-tolerant, multi-process job queue built on Node.js, PostgreSQL, and Redis Streams using a transactional outbox, with at-least-once delivery",
   "devDependencies": {
     "autocannon": "^8.0.0"
   }

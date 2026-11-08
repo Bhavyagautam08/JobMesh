@@ -190,7 +190,7 @@ export default function JobDetail() {
 
   return <div className="jd-shell">
     <aside className="jd-sidebar">
-      <div className="jd-brand"><div className="brand-mark"><span /><span /><span /></div><div><strong>JobMesh</strong><small>DISTRIBUTED RUNTIME</small></div></div>
+      <div className="jd-brand"><div className="brand-mark"><span /><span /><span /></div><div><strong>JobMesh</strong><small>MULTI-PROCESS RUNTIME</small></div></div>
       <nav>
         <div className="nav-label">CONTROL PLANE</div>
         {navItems.map((item) => <Link to={item.to} key={item.name} className={`nav-item ${item.name === "Jobs" ? "active" : ""}`}>

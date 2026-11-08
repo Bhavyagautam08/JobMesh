@@ -296,7 +296,7 @@ function App() {
       </header>
       <div className="content">
         <div className="page-header">
-          <div><h1>Command Center</h1><p>Real-time overview of distributed job processing.</p></div>
+          <div><h1>Command Center</h1><p>Real-time overview of fault-tolerant job processing.</p></div>
           <div className="page-actions"><Button icon="refresh" onClick={refresh} loading={refreshing}>Refresh</Button><Link to="/jobs/create" style={{ textDecoration: 'none' }}><Button variant="primary" icon="plus">Create Job</Button></Link></div>
         </div>
 

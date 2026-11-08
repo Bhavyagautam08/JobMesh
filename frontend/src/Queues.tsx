@@ -79,7 +79,7 @@ export default function Queues() {
 
   return <div className="qs-shell qs-queue-page">
     <aside className="qs-sidebar">
-      <div className="qs-brand"><div className="qs-brand-mark"><span /><span /><span /></div><div><strong>Job Control Plane</strong><small>DISTRIBUTED RUNTIME</small></div></div>
+      <div className="qs-brand"><div className="qs-brand-mark"><span /><span /><span /></div><div><strong>Job Control Plane</strong><small>MULTI-PROCESS RUNTIME</small></div></div>
       <nav><div className="qs-nav-label">CONTROL PLANE</div>{navItems.map((item) =>
         <Link key={item.name} to={item.path} className={`qs-nav-item ${item.name === "Queue" ? "active" : ""}`}><Icon name={item.icon} size={17} /><span>{item.name}</span></Link>
       )}</nav>

@@ -1,7 +1,6 @@
-# JobMesh
+# JobMesh: Fault-Tolerant Job Queue
 
-**JobMesh is a full-stack distributed job-processing platform for submitting,
-dispatching, executing, and monitoring asynchronous work.** Its Node.js API
+**JobMesh is a multi-process job queue built on Node.js, PostgreSQL, and Redis Streams using a transactional outbox, with at-least-once delivery.** Its Node.js API
 accepts authenticated job requests and persists each job together with a
 transactional outbox event in PostgreSQL. An outbox publisher delivers those
 events through Redis Streams, where independently running workers compete to
@@ -62,6 +61,13 @@ flowchart LR
   delivery, queue health, worker leases, and API metrics from the dashboard.
 - **Built-in workload types:** calculate primes, process JSON, run CPU-intensive
   work, and execute duration-based long-running jobs.
+
+## Scope and limitations
+
+- **Single-host evaluation:** All benchmarks and verification suites were run on a single host. Multi-host operation has not been tested.
+- **At-least-once delivery:** Event delivery through Redis Streams provides at-least-once delivery, not exactly-once delivery. The atomic job claim in PostgreSQL absorbs duplicate deliveries to prevent duplicate job executions.
+- **Backlog latency under sustained load:** The sustained 3,000-job benchmark's p95 latency reflects queue backlog because job submissions outpaced worker completion rates during the test.
+- **Benchmark evidence:** Detailed test methodology, historical run parameters, and qualification notes are documented in [`test.md`](test.md), with raw result files archived in [`backend/benchmarks/results/`](backend/benchmarks/results/).
 
 ## Screenshots
 
@@ -126,3 +132,7 @@ The backend test suite can be run with:
 ```sh
 npm test --prefix backend
 ```
+
+## Benchmarks and verification
+
+Performance benchmarks, concurrency tests, and crash-recovery scenarios are documented with full methodology and qualification in [`test.md`](test.md). Historical raw evidence files (JSON, CSV) are preserved in [`backend/benchmarks/results/`](backend/benchmarks/results/). Additional benchmark instructions can be found in [`backend/benchmarks/README.md`](backend/benchmarks/README.md).

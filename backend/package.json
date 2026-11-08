@@ -1,7 +1,7 @@
 {
-  "name": "distributed-job-system",
+  "name": "jobmesh",
   "version": "1.0.0",
-  "description": "Full-stack distributed job-processing platform with a Node.js API, PostgreSQL outbox, Redis Streams, background workers, retries, and a real-time React dashboard",
+  "description": "Fault-tolerant, multi-process job queue built on Node.js, PostgreSQL, and Redis Streams using a transactional outbox, with at-least-once delivery",
   "type": "module",
   "main": "server.js",
   "scripts": {

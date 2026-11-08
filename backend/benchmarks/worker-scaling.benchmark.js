@@ -189,7 +189,7 @@ async function runScalingBenchmark() {
 
     const fourWorkerGain = ((results[2].throughput - baseThroughput) / baseThroughput) * 100;
     console.log("🎯 Resume Bullet Metric Target:");
-    console.log(`"Scaled distributed worker pool across 1, 2, and 4 concurrent processes, achieving a ${fourWorkerGain.toFixed(0)}% throughput increase (${baseThroughput.toFixed(1)} → ${results[2].throughput.toFixed(1)} jobs/sec) under sustained compute workload."\n`);
+    console.log(`"Scaled multi-process worker pool across 1, 2, and 4 concurrent processes, achieving a ${fourWorkerGain.toFixed(0)}% throughput increase (${baseThroughput.toFixed(1)} → ${results[2].throughput.toFixed(1)} jobs/sec) under sustained compute workload."\n`);
 
     await pool.end();
 }
