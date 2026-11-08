@@ -54,6 +54,11 @@ let activeResourceSamples = [];
 let previousProcessSample;
 let backlogSamplingTimer;
 let resourceSampleInFlight = false;
+let dockerStatsProcess;
+let dockerStatsError;
+let dockerStatsStderr = "";
+let dockerStatsSamples = new Map();
+let resourceSamplingActive = false;
 
 function percentile(values, fraction) {
   if (values.length === 0) return null;
@@ -533,10 +538,82 @@ async function seedJobs(prefix, specs) {
 }
 
 function parseDockerBytes(value) {
+  if (typeof value !== "string") return null;
   const match = value.match(/([\d.]+)\s*(B|KiB|MiB|GiB)/i);
   if (!match) return null;
   const multiplier = { B: 1, KiB: 1024, MiB: 1024 ** 2, GiB: 1024 ** 3 }[match[2]];
   return Math.round(Number(match[1]) * multiplier);
+}
+
+function recordDockerStatsLine(line) {
+  const cleanLine = line.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").trim();
+  const [rawName, cpu, memory] = cleanLine.split("|");
+  const name = rawName?.replace(/^\/+/, "");
+  if (![postgresContainer, redisContainer].includes(name)) return;
+  const [usedMemory, memoryLimit] = (memory || "").split("/").map((part) => part.trim());
+  dockerStatsSamples.set(name, {
+    sampledAt: Date.now(),
+    cpuPercent: Number.parseFloat(cpu),
+    memoryUsedBytes: usedMemory ? parseDockerBytes(usedMemory) : null,
+    memoryLimitBytes: memoryLimit ? parseDockerBytes(memoryLimit) : null,
+    memoryUsage: memory || null
+  });
+}
+
+async function startDockerStats() {
+  dockerStatsSamples = new Map();
+  dockerStatsError = undefined;
+  dockerStatsStderr = "";
+  resourceSamplingActive = true;
+  dockerStatsProcess = spawn("docker", [
+    "stats", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}",
+    postgresContainer, redisContainer
+  ], { windowsHide: true });
+  dockerStatsProcess.stdout.setEncoding("utf8");
+  dockerStatsProcess.stderr.setEncoding("utf8");
+  let buffer = "";
+  dockerStatsProcess.stdout.on("data", (chunk) => {
+    buffer += chunk;
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+    for (const line of lines.map((value) => value.trim()).filter(Boolean)) {
+      recordDockerStatsLine(line);
+    }
+  });
+  dockerStatsProcess.stderr.on("data", (chunk) => {
+    dockerStatsStderr = `${dockerStatsStderr}${chunk}`.slice(-4096);
+  });
+  dockerStatsProcess.once("error", (error) => {
+    if (resourceSamplingActive) dockerStatsError = error.message;
+  });
+  dockerStatsProcess.once("close", (code, signal) => {
+    if (resourceSamplingActive) {
+      dockerStatsError = dockerStatsStderr.trim()
+        || `docker stats exited with code ${code} (${signal || "no signal"})`;
+    }
+  });
+
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    if (dockerStatsError) {
+      const error = dockerStatsError;
+      await stopDockerStats();
+      throw new Error(`Docker resource sampling failed to start: ${error}`);
+    }
+    if ([postgresContainer, redisContainer].every((name) => dockerStatsSamples.has(name))) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  await stopDockerStats();
+  throw new Error(`docker stats did not return both ${postgresContainer} and ${redisContainer} within 15 seconds`);
+}
+
+async function stopDockerStats() {
+  resourceSamplingActive = false;
+  const child = dockerStatsProcess;
+  dockerStatsProcess = undefined;
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  child.kill();
+  await waitForExit(child, 5000);
 }
 
 function runCommand(executable, args, timeoutMs) {
@@ -586,18 +663,11 @@ async function sampleLocalResources() {
   }
 
   const processScript = `$pids=@(${processIds.join(",")}); Get-Process -Id $pids -ErrorAction SilentlyContinue | Select-Object Id,CPU,WorkingSet64 | ConvertTo-Json -Compress`;
-  const dockerArgs = [
-    "stats", "--no-stream", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}",
-    postgresContainer, redisContainer
-  ];
-  const [processOutcome, dockerOutcome] = await Promise.all([
-    runCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", processScript], 10000)
-      .then((result) => ({ result }))
-      .catch((error) => ({ error })),
-    runCommand("docker", dockerArgs, 15000)
-      .then((result) => ({ result }))
-      .catch((error) => ({ error }))
-  ]);
+  const processOutcome = await runCommand(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-Command", processScript],
+    10000
+  ).then((result) => ({ result })).catch((error) => ({ error }));
   if (processOutcome.error) {
     sample.processSampleError = processOutcome.error.message;
   } else if (!processOutcome.result.stdout.trim()) {
@@ -633,24 +703,24 @@ async function sampleLocalResources() {
     }
   }
 
-  if (dockerOutcome.error) {
-    sample.containerSampleError = dockerOutcome.error.message;
-  } else {
-    for (const line of dockerOutcome.result.stdout.trim().split(/\r?\n/).filter(Boolean)) {
-      const [name, cpu, memory] = line.split("|");
-      const [usedMemory, memoryLimit] = (memory || "").split("/").map((part) => part.trim());
-      const containerSample = {
-        cpuPercent: Number.parseFloat(cpu),
-        memoryUsedBytes: usedMemory ? parseDockerBytes(usedMemory) : null,
-        memoryLimitBytes: memoryLimit ? parseDockerBytes(memoryLimit) : null,
-        memoryUsage: memory || null
-      };
-      if (name === postgresContainer || name === postgresContainer.replace(/^\//, "")) sample.postgres = containerSample;
-      if (name === redisContainer || name === redisContainer.replace(/^\//, "")) sample.redis = containerSample;
-    }
-    if (!sample.postgres || !sample.redis) {
-      sample.containerSampleError = `docker stats did not return both ${postgresContainer} and ${redisContainer}`;
-    }
+  const now = Date.now();
+  const postgresSample = dockerStatsSamples.get(postgresContainer);
+  const redisSample = dockerStatsSamples.get(redisContainer);
+  sample.postgres = postgresSample ? { ...postgresSample, ageMs: now - postgresSample.sampledAt } : null;
+  sample.redis = redisSample ? { ...redisSample, ageMs: now - redisSample.sampledAt } : null;
+  if (dockerStatsError) {
+    sample.containerSampleError = dockerStatsError;
+  } else if (!sample.postgres || !sample.redis) {
+    sample.containerSampleError = `docker stats did not return both ${postgresContainer} and ${redisContainer}`;
+  } else if (
+    !Number.isFinite(sample.postgres.cpuPercent)
+    || !Number.isFinite(sample.postgres.memoryUsedBytes)
+    || !Number.isFinite(sample.redis.cpuPercent)
+    || !Number.isFinite(sample.redis.memoryUsedBytes)
+  ) {
+    sample.containerSampleError = "docker stats returned incomplete CPU or memory data";
+  } else if (sample.postgres.ageMs > 2500 || sample.redis.ageMs > 2500) {
+    sample.containerSampleError = "docker stats container sample was older than 2500ms";
   }
   sample.timestamp = new Date().toISOString();
   return sample;
@@ -669,6 +739,7 @@ async function captureResourceSample() {
 async function startResourceSampling() {
   activeResourceSamples = [];
   previousProcessSample = undefined;
+  await startDockerStats();
   await captureResourceSample();
   samplingTimer = setInterval(() => {
     void captureResourceSample().catch((error) =>
@@ -684,6 +755,7 @@ async function stopResourceSampling(name) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   await captureResourceSample();
+  await stopDockerStats();
   const samples = activeResourceSamples;
   const path = await saveScenarioResult(`${name}-resource-samples`, samples);
   return { samples, path };
@@ -695,6 +767,7 @@ function summarizeResourceSampling(samples, expectedWorkerCount) {
   );
   const errors = samples.flatMap((sample, index) => {
     const sampleErrors = [];
+    if (sample.sampleError) sampleErrors.push(`sample ${index + 1}: ${sample.sampleError}`);
     if (sample.processSampleError) sampleErrors.push(`sample ${index + 1}: ${sample.processSampleError}`);
     if (sample.containerSampleError) sampleErrors.push(`sample ${index + 1}: ${sample.containerSampleError}`);
     if (!sample.api || sample.workers.length !== expectedWorkerCount) {
@@ -717,9 +790,9 @@ function summarizeResourceSampling(samples, expectedWorkerCount) {
 
 async function runWorkerScaling(count, handlerType, results) {
   const prefix = `benchmark:${runId}:scale-${handlerType}-${count}:`;
-  const specs = Array.from({ length: 240 }, (_, index) => handlerType === "long_running"
-    ? { type: handlerType, payload: { durationMs: 100 } }
-    : { type: handlerType, payload: { iterations: 400000 } });
+  const specs = Array.from({ length: 240 }, () => handlerType === "long_running"
+    ? { type: handlerType, payload: { durationMs: 500 } }
+    : { type: handlerType, payload: { iterations: 4000000 } });
   await seedJobs(prefix, specs);
   report.activeScenario = { category: "worker-scaling", workerCount: count, handlerType, phase: "waiting-for-outbox" };
   await saveReport();
@@ -750,7 +823,7 @@ async function runWorkerScaling(count, handlerType, results) {
     category: "worker-scaling",
     workerCount: count,
     handlerType,
-    workload: { totalJobs: specs.length, handlerType, payload: handlerType === "long_running" ? { durationMs: 100 } : { iterations: 400000 } },
+    workload: { totalJobs: specs.length, handlerType, payload: handlerType === "long_running" ? { durationMs: 500 } : { iterations: 4000000 } },
     executionWallMs: Number(executionWallMs.toFixed(3)),
     executionThroughputJobsPerSecond: Number((specs.length / (executionWallMs / 1000)).toFixed(3)),
     jobMetrics: metrics,
@@ -1173,6 +1246,7 @@ main()
     stopping = true;
     if (samplingTimer) clearInterval(samplingTimer);
     if (backlogSamplingTimer) clearInterval(backlogSamplingTimer);
+    await stopDockerStats();
     await stopWorkers();
     await stopProcess(outboxProcess);
     await stopProcess(apiProcess);
